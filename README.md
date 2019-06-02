@@ -1,6 +1,7 @@
 # AOPParsing
 
 ###1. 什么是AOP
+
 AOP: `Aspect Oriented Programming` 面向切面编程。通过预编译方式和运行期动态代理实现程序功能的统一维护的一种技术，针对业务处理过程中的切面进行提取，它所面对的是处理过程中的某个步骤或阶段，以获得逻辑过程中各部分之间低耦合性的隔离效果（在不修改源代码的情况下，通过运行时给程序添加统一功能！）
 ###2. Aspects实现原理
 Aspects是利用了OC的`消息转发机制`！如果是实例对象，则使用runtime动态创建对象的子类，在子类中使用swizzling method的方式，添加一个别名SEL来记录被hook的SEL，然后把子类或类对象中的`forwardInvocation`的IMP替成`__ASPECTS_ARE_BEING_CALLED__`，如果是类对象则只是方法替换，在`__ASPECTS_ARE_BEING_CALLED__`中进行拦截处理！
