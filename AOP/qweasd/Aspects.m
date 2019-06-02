@@ -16,9 +16,9 @@
 
 // Block internals.
 typedef NS_OPTIONS(int, AspectBlockFlags) {
-    // 捕获外界变量 (复制了正在被hook的方法的签名signature类型)
+    // 捕获外界变量
 	AspectBlockFlagsHasCopyDisposeHelpers = (1 << 25),
-    // 方法有签名信息，Block也有签名信息
+    // Block有签名信息
 	AspectBlockFlagsHasSignature          = (1 << 30)
 };
 /*
@@ -34,10 +34,11 @@ typedef struct _AspectBlock {
 		unsigned long int reserved;
 		unsigned long int size;
 		// requires AspectBlockFlagsHasCopyDisposeHelpers
+        // 函数指针  个人观点：对block内部中的局部变量使用了__block,则会添加copy和dispose函数指针 （而copy指针的动作是在该函数中执行）
 		void (*copy)(void *dst, const void *src);
 		void (*dispose)(const void *);
 		// requires AspectBlockFlagsHasSignature
-		const char *signature;
+        const char *signature; // 方法签名  -> 就是当前block的type:v@?i
 		const char *layout;
 	} *descriptor;
 	// imported variables
@@ -65,7 +66,7 @@ typedef struct _AspectBlock {
 + (instancetype)identifierWithSelector:(SEL)selector object:(id)object options:(AspectOptions)options block:(id)block error:(NSError **)error;
 // 对比block的方法签名和待hook的方法签名是否兼容（参数个数，按照顺序的类型）
 - (BOOL)invokeWithInfo:(id<AspectInfo>)info;
-@property (nonatomic, assign) SEL selector;
+@property (nonatomic, assign) SEL selector; // 被hook方法
 @property (nonatomic, strong) id block;  //外界的Block
 @property (nonatomic, strong) NSMethodSignature *blockSignature;
 @property (nonatomic, weak) id object;
@@ -146,7 +147,7 @@ static NSString *const AspectsMessagePrefix = @"aspects_";
 ///////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark - Private Helper
 
-/* 第一步总结
+/* 准备总结
  1.首先调用aspect_performLocked ，利用自旋锁，保证整个操作的线程安全
  2.接着调用aspect_isSelectorAllowedAndTrack对传进来的参数进行强校验，保证参数合法性。
  3.接着创建AspectsContainer容器，利用AssociatedObject关联对象动态添加到NSObject分类中作为属性的。
@@ -179,9 +180,8 @@ static id aspect_add(id self, SEL selector, AspectOptions options, id block, NSE
             // 创建一个新的AspectIdentifier
             identifier = [AspectIdentifier identifierWithSelector:selector object:self options:options block:block error:error];
             
-            // 可能会创建失败，那就是aspect_isCompatibleBlockSignature方法返回NO。返回NO就意味着，我们要替换的方法block和要替换的原方法，两者的方法签名是不相符的。
+            // 可能会创建失败，那就是aspect_isCompatibleBlockSignature方法返回NO。返回NO就意味着，block和要被hook的方法，两者的方法签名是不相符的。
             if (identifier) {
-                
                 // 完成了容器和AspectIdentifier初始化之后，就可以开始准备进行hook了。通过options选项分别添加到容器中的beforeAspects,insteadAspects,afterAspects这三个数组
                 [aspectContainer addAspect:identifier withOptions:options];
 
@@ -194,11 +194,14 @@ static id aspect_add(id self, SEL selector, AspectOptions options, id block, NSE
 }
 
 #pragma MARK 销毁aspect流程
+
+// 把AspectsContainer都置为空，remove最关键的过程就是aspect_cleanupHookedClassAndSelector(self, aspect.selector);移除之前hook的class和selector。
 static BOOL aspect_remove(AspectIdentifier *aspect, NSError **error) {
     NSCAssert([aspect isKindOfClass:AspectIdentifier.class], @"Must have correct type.");
 
     __block BOOL success = NO;
     aspect_performLocked(^{
+        
         id self = aspect.object; // strongify
         if (self) {
             AspectsContainer *aspectContainer = aspect_getContainerForObject(self, aspect.selector);
@@ -221,7 +224,9 @@ static BOOL aspect_remove(AspectIdentifier *aspect, NSError **error) {
 
 /*
    主要是为了保证线程安全!!!
-   用了OSSpinLockLock加锁机制，保证线程安全并且性能高。不过这种锁已经不在安全，主要原因发生在低优先级线程拿到锁时，高优先级线程进入忙等(busy-wait)状态，消耗大量 CPU 时间，从而导致低优先级线程拿不到 CPU 时间，也就无法完成任务并释放锁。
+   OSSpinLockLock加锁机制，保证线程安全并且性能高。
+ 
+   提示:不过这种锁已经不在安全，主要原因发生在低优先级线程拿到锁时，高优先级线程进入忙等(busy-wait)状态，消耗大量 CPU 时间，从而导致低优先级线程拿不到 CPU 时间，也就无法完成任务并释放锁。苹果的工程师停用了 OSSpinLock
  */
 static void aspect_performLocked(dispatch_block_t block) {
     static OSSpinLock aspect_lock = OS_SPINLOCK_INIT;
@@ -238,20 +243,24 @@ static SEL aspect_aliasForSelector(SEL selector) {
 }
 
 static NSMethodSignature *aspect_blockMethodSignature(id block, NSError **error) {
-    // 因为没法直接拿到block的签名信息，所以将block强制类型转换为AspectBlockRef
+    // 因为不能直接拿到block的签名信息，所以将block强制类型转换为AspectBlockRef
     AspectBlockRef layout = (__bridge void *)block;
     
-    // 根据标志位和结构体的结构，获取signature
+    // 通过flags判断是否存在方法签名
 	if (!(layout->flags & AspectBlockFlagsHasSignature)) {
         NSString *description = [NSString stringWithFormat:@"The block %@ doesn't contain a type signature.", block];
         AspectError(AspectErrorMissingBlockSignature, description);
         return nil;
     }
+    // 获取block的descriptor,在descriptor获取方法签名
 	void *desc = layout->descriptor;
+    // 由于全局block和堆block，signature存在的位置不同,所以需要判断. （copy以及dispose两个函数在堆block才会存在）
 	desc += 2 * sizeof(unsigned long int);
+    
 	if (layout->flags & AspectBlockFlagsHasCopyDisposeHelpers) {
 		desc += 2 * sizeof(void *);
     }
+    
 	if (!desc) {
         NSString *description = [NSString stringWithFormat:@"The block %@ doesn't has a type signature.", block];
         AspectError(AspectErrorMissingBlockSignature, description);
@@ -262,7 +271,7 @@ static NSMethodSignature *aspect_blockMethodSignature(id block, NSError **error)
 	return [NSMethodSignature signatureWithObjCTypes:signature];
 }
 
-//总结:就是匹配原方法的参数与block参数
+// 就是匹配原方法的参数与block参数
 static BOOL aspect_isCompatibleBlockSignature(NSMethodSignature *blockSignature, id object, SEL selector, NSError **error) {
     NSCParameterAssert(blockSignature);
     NSCParameterAssert(object);
@@ -346,13 +355,14 @@ static IMP aspect_getMsgForwardIMP(NSObject *self, SEL selector) {
 
 #pragma mark 核心
 // 动态生成子类(带有_Aspects_后缀的子类),并交换类的原方法的实现为_objc_msgForward 使其直接进入消息转发模式
+// 注意：实例对象会创建子类，返回子类！但类对象不会创建，返回本身
 static void aspect_prepareClassAndHookSelector(NSObject *self, SEL selector, NSError **error) {
     NSCParameterAssert(selector);
     
     // 生成子类或者直接替换类方法
     Class klass = aspect_hookClass(self, error);
     
-    // klass是我们hook完原始的class之后得到的子类,因为它是当前类的子类，所以可以从它这里获取到原有的selector的IMP
+    // klass是我们hook完原始的class之后得到的类,可以从它这里获取到原有的selector的IMP
     Method targetMethod = class_getInstanceMethod(klass, selector);
     IMP targetMethodIMP = method_getImplementation(targetMethod);
     // 判断当前IMP是不是_objc_msgForward或者_objc_msgForward_stret，即判断当前IMP是不是消息转发
@@ -360,7 +370,7 @@ static void aspect_prepareClassAndHookSelector(NSObject *self, SEL selector, NSE
         // Make a method alias for the existing method implementation, it not already copied.
         const char *typeEncoding = method_getTypeEncoding(targetMethod);
         SEL aliasSelector = aspect_aliasForSelector(selector);
-        // 如果子类不能响应aspects_xxxx
+        // 如果该类不能响应aspects_xxxx
         if (![klass instancesRespondToSelector:aliasSelector]) {
             // 就为klass添加aspects_xxxx方法,方法的实现为原生方法的实现
             __unused BOOL addedAlias = class_addMethod(klass, aliasSelector, method_getImplementation(targetMethod), typeEncoding);
@@ -368,7 +378,7 @@ static void aspect_prepareClassAndHookSelector(NSObject *self, SEL selector, NSE
         }
 
         // We use forwardInvocation to hook in.
-        // 交换类的原方法的实现为_objc_msgForward
+        // 把类的原方法的改为_objc_msgForward
         class_replaceMethod(klass, selector, aspect_getMsgForwardIMP(self, selector), typeEncoding);
         AspectLog(@"Aspects: Installed hook for -[%@ %@].", klass, NSStringFromSelector(selector));
     }
@@ -379,7 +389,7 @@ static void aspect_cleanupHookedClassAndSelector(NSObject *self, SEL selector) {
     NSCParameterAssert(self);
     NSCParameterAssert(selector);
 
-    // klass是现在的class(原来的类)，如果是元类，就转换成元类。
+    
 	Class klass = object_getClass(self);
     BOOL isMetaClass = class_isMetaClass(klass);
     if (isMetaClass) {
@@ -387,7 +397,7 @@ static void aspect_cleanupHookedClassAndSelector(NSObject *self, SEL selector) {
     }
 
     
-    // 先恢复MsgForward消息转发函数，获得方法签名，然后把原始转发方法替换回我们hook过的方法。
+    // 获取原来类的方法的IMP是不是指向了_objc_msgForward,如果是,就把该方法的IMP再指回去
     // Check if the method is marked as forwarded and undo that.
     Method targetMethod = class_getInstanceMethod(klass, selector);
     IMP targetMethodIMP = method_getImplementation(targetMethod);
@@ -417,6 +427,7 @@ static void aspect_cleanupHookedClassAndSelector(NSObject *self, SEL selector) {
         // Figure out how the class was modified to undo the changes.
         NSString *className = NSStringFromClass(klass);
         if ([className hasSuffix:AspectsSubclassSuffix]) {
+            // 把新建类的isa指针指向原来类
             Class originalClass = NSClassFromString([className stringByReplacingOccurrencesOfString:AspectsSubclassSuffix withString:@""]);
             NSCAssert(originalClass != nil, @"Original class must exist");
             object_setClass(self, originalClass);
@@ -474,12 +485,12 @@ static Class aspect_hookClass(NSObject *self, NSError **error) {
             AspectError(AspectErrorFailedToAllocateClassPair, errrorDesc);
             return nil;
         }
-        // 替换当前类forwardInvocation方法的实现为__ASPECTS_ARE_BEING_CALLED__
+        // 替换子类forwardInvocation方法的实现为__ASPECTS_ARE_BEING_CALLED__
 		aspect_swizzleForwardInvocation(subclass);
         
-        // 把class的实例方法替换成返回statedClass，也就是说把调用class时候的isa指向了statedClass了 (把子类的Aspect_xx方法 IMP指针指向了原方法)
+        // 把class的实例方法替换成返回statedClass，也就是说把调用class时候的isa指向了statedClass了
         
-        // 修改了 subclass 以及其 subclass metaclass 的 class 方法,使他返回当前对象的 class 隐藏对外的Class (优先)
+        // 修改了 subclass 以及其 subclass metaclass 的 class 方法,使他返回当前对象的 class 隐藏对外的Class
 		aspect_hookedGetClass(subclass, statedClass); //把subclass的isa指向了statedClass
 		aspect_hookedGetClass(object_getClass(subclass), statedClass);//把subclass的元类的isa，也指向了statedClass
         
@@ -494,13 +505,15 @@ static Class aspect_hookClass(NSObject *self, NSError **error) {
 static NSString *const AspectsForwardInvocationSelectorName = @"__aspects_forwardInvocation:";
 
 
-// 替换子类的forwardInvocation为__ASPECTS_ARE_BEING_CALLED__
+// 替换类的forwardInvocation为__ASPECTS_ARE_BEING_CALLED__
 static void aspect_swizzleForwardInvocation(Class klass) {
     NSCParameterAssert(klass);
     // If there is no method, replace will act like class_addMethod.
     IMP originalImplementation = class_replaceMethod(klass, @selector(forwardInvocation:), (IMP)__ASPECTS_ARE_BEING_CALLED__, "v@:@");
     
-    // 如果存在,把原有类的forwardInvocation保存起来 (当调用hook方法,原函数没有实现,则调用原类的消息转发)
+    // 如果存在,把原有类的forwardInvocation保存起来 (当调用hook方法,原函数没有实现,则调用原类的消息转发，可以解决JSPatch兼容的问题)
+    // 关于兼容问题可查看：https://www.jianshu.com/p/dc1deaa1b28e
+    
     if (originalImplementation) {
         // 不为空的话说明原方法有实现，添加一个新方法__aspects_forwardInvocation:指向了原来的originalImplementation，在__ASPECTS_ARE_BEING_CALLED__那里如果不能处理，判断是否有实现__aspects_forwardInvocation，有的话就转发。
         class_addMethod(klass, NSSelectorFromString(AspectsForwardInvocationSelectorName), originalImplementation, "v@:@");
@@ -699,7 +712,7 @@ static NSMutableDictionary *aspect_getSwizzledClassesDict() {
 }
 
 /*
-    类方法hook判断合法性的代码 (以上是元类的类方法hook判断合法性的代码)
+    类方法hook判断合法性的代码
     总结:如果不是元类，只要不是hook这"retain", "release", "autorelease", "forwardInvocation:"4种方法，而且hook “dealloc”方法的时机必须是before，并且selector能被找到，那么方法就可以被hook。
  */
 static BOOL aspect_isSelectorAllowedAndTrack(NSObject *self, SEL selector, AspectOptions options, NSError **error) {
@@ -735,7 +748,7 @@ static BOOL aspect_isSelectorAllowedAndTrack(NSObject *self, SEL selector, Aspec
         return NO;
     }
 
-    // class_isMetaClass 先判断是不是元类。接下来的判断都是判断元类里面能否允许被替换方法。
+    // class_isMetaClass 先判断是不是元类。如果是元类则判断元类里能否允许被替换方法。
     if (class_isMetaClass(object_getClass(self))) {
         Class klass = [self class];
         NSMutableDictionary *swizzledClassesDict = aspect_getSwizzledClassesDict();
@@ -983,6 +996,7 @@ static void aspect_deregisterTrackedSelector(id self, SEL selector) {
 - (BOOL)invokeWithInfo:(id<AspectInfo>)info {
     NSInvocation *blockInvocation = [NSInvocation invocationWithMethodSignature:self.blockSignature];
     
+    
     NSInvocation *originalInvocation = info.originalInvocation;
     NSUInteger numberOfArguments = self.blockSignature.numberOfArguments;
 
@@ -1016,6 +1030,7 @@ static void aspect_deregisterTrackedSelector(id self, SEL selector) {
     //执行block
     [blockInvocation invokeWithTarget:self.block];
     
+    
     if (argBuf != NULL) {
         free(argBuf);
     }
@@ -1041,7 +1056,7 @@ static void aspect_deregisterTrackedSelector(id self, SEL selector) {
     return self.beforeAspects.count > 0 || self.insteadAspects.count > 0 || self.afterAspects.count > 0;
 }
 
-// 把每个hook方法信息存进来
+// 根据传入的切面时机,进行对应数组的存储;
 - (void)addAspect:(AspectIdentifier *)aspect withOptions:(AspectOptions)options {
     NSParameterAssert(aspect);
     NSUInteger position = options&AspectPositionFilter;

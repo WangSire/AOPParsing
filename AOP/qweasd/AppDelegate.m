@@ -23,14 +23,31 @@
     
     
     
-    
+    // 在一个继承链上，一个selector只能被hook一次 (同一个类中selector可以被hook多次)
 //    [PeopleModel aspect_hookSelector:@selector(systemMethod_PrintLogWithIndex:name:) withOptions:AspectPositionBefore usingBlock:^(id<AspectInfo> info){
 //        NSLog(@"执行了");
 //    } error:nil];
+//    [ChildModel aspect_hookSelector:@selector(systemMethod_PrintLogWithIndex:name:) withOptions:AspectPositionAfter usingBlock:^(id<AspectInfo> info){
+//        NSLog(@"子类");
+//    } error:nil];
     
-    [PeopleModel aspect_hookSelector:@selector(ll_imageName) withOptions:AspectOptionAutomaticRemoval usingBlock:^(id<AspectInfo> info){
-        NSLog(@"ll_imageName");
+    
+    
+    __block int i = 2;
+    PeopleModel *people = [[PeopleModel alloc]init];
+    [people aspect_hookSelector:@selector(ll_imageName) withOptions:AspectPositionAfter usingBlock:^(id<AspectInfo> info){
+        i = 3;
+//        NSLog(@"ll_imageName, %d",i);
     } error:nil];
+    
+    [people ll_imageName];
+//
+//    ChildModel *child = [[ChildModel alloc]init];
+//    [child aspect_hookSelector:@selector(ll_imageName) withOptions:AspectPositionAfter usingBlock:^(id<AspectInfo> info){
+//        NSLog(@"子类");
+//    } error:nil];
+//    [child ll_imageName];
+    
   
     return YES;
 }
